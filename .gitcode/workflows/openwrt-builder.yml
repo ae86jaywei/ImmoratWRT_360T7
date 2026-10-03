@@ -1,0 +1,174 @@
+#
+# GitCode / AtomGit Action 版本的 OpenWrt(ImmortalWrt) 固件编译流水线
+#
+# 由 .github/workflows/openwrt-builder.yml (P3TERX/Actions-OpenWrt 模板) 改写而来。
+# 主要差异：
+#   1. 文件位置：.gitcode/workflows/*.yml（原 .github/workflows/ 在 GitCode 上不生效）
+#   2. runs-on：改为 AtomGit 三段式标签 {os}-{version},{arch},{flavor}
+#   3. 上下文变量：GITHUB_* → atomgit.* / ATOMGIT_OUTPUT / ATOMGIT_ENV
+#   4. 第三方 Action（softprops/action-gh-release、delete-workflow-runs、
+#      delete-older-releases）为 GitHub Marketplace 专属，GitCode 无法引用，已移除；
+#      产物统一通过官方 upload-artifact 插件下载。
+#   5. 移除 GitHub 专属的磁盘腾挪步骤（AtomGit large 规格 200G 磁盘，无需腾空间）
+#   6. 依赖包列表剔除 Ubuntu 24.04 已不存在的 python2.7 / mkisofs，避免 apt 整条失败
+#
+
+name: OpenWrt Builder (GitCode)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: '源码地址（默认 GitCode 国内镜像，可改为 GitHub 上游）'
+        required: false
+        type: string
+        default: 'https://gitcode.com/GitHub_Trending/im/immortalwrt.git'
+      repo_branch:
+        description: '源码分支'
+        required: false
+        type: string
+        default: 'master'
+      flavor:
+        description: 'Runner 资源规格'
+        required: false
+        type: choice
+        options:
+          - large
+          - xlarge
+          - medium
+        default: 'large'
+
+env:
+  REPO_URL: ${{ inputs.repo_url }}
+  REPO_BRANCH: ${{ inputs.repo_branch }}
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_FIRMWARE: true
+  TZ: Asia/Shanghai
+
+# 同一时间只允许一个固件编译，避免排队浪费资源
+concurrency:
+  enable: true
+  max: 1
+  exceed-action: QUEUE
+
+permissions:
+  repository: read
+
+jobs:
+  build:
+    name: 编译 ImmortalWrt 固件
+    # medium = 4核/16G/100G，large = 8核/32G/200G，xlarge = 16核/64G/500G
+    # 注意：官方文档说明预装工具会占用空间，实际可用磁盘略小于标注值
+    # 注意：${{ }} 表达式在数组中必须加引号，否则会被解析成 flow mapping 而报语法错误
+    runs-on: [ubuntu-latest, x64, "${{ inputs.flavor }}"]
+    # 默认超时 4320 分钟（72 小时），这里显式收紧到 6 小时
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: 拉取仓库代码
+      uses: checkout
+
+    - name: 安装必需编译依赖
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install -y --no-install-recommends \
+          autoconf automake binutils bison build-essential bzip2 ccache cmake cpio curl \
+          device-tree-compiler diffstat flex gawk gcc-multilib g++-multilib gettext git \
+          libelf-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev \
+          libssl-dev libtool patch pkgconf python3 python3-setuptools python3-pyelftools \
+          rsync squashfs-tools subversion tar unzip vim wget which xxd zlib1g-dev \
+          bc file zstd
+        sudo -E apt-get -qq clean
+
+    - name: 设置时区（失败不阻塞）
+      continue-on-error: true
+      run: sudo timedatectl set-timezone "$TZ"
+
+    - name: 安装可选编译依赖（失败不阻塞）
+      continue-on-error: true
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -qq install -y --no-install-recommends \
+          antlr3 asciidoc ack fastjar gperf help2man intltool libglib2.0-dev libgmp3-dev \
+          libltdl-dev libmpc-dev libmpfr-dev libfuse-dev lzip mercurial ninja-build \
+          p7zip-full scons swig texinfo time upx-ucl xmlto
+
+    - name: 克隆源码
+      run: |
+        echo "源码地址：$REPO_URL  分支：$REPO_BRANCH"
+        git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" openwrt
+        df -hT .
+
+    - name: 载入自定义 feeds
+      run: |
+        # 用 if 块而非 "[ -e ] && mv"：后者在文件不存在时会让整步以非零码退出
+        if [ -e "$FEEDS_CONF" ]; then
+          mv "$FEEDS_CONF" openwrt/feeds.conf.default
+        fi
+        chmod +x "$DIY_P1_SH"
+        cd openwrt && ../"$DIY_P1_SH"
+
+    - name: 更新 feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: 安装 feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: 载入自定义配置
+      run: |
+        if [ -e files ]; then mv files openwrt/files; fi
+        if [ -e "$CONFIG_FILE" ]; then mv "$CONFIG_FILE" openwrt/.config; fi
+        chmod +x "$DIY_P2_SH"
+        cd openwrt && ../"$DIY_P2_SH"
+
+    - name: 下载编译依赖包
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8 || make download -j1 V=s
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: 编译固件
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j"$(nproc)" || make -j1 || make -j1 V=s
+        echo "status=success" >> "$ATOMGIT_OUTPUT"
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config \
+          | sed -r 's/.*DEVICE_(.*)=y/\1/' > ../DEVICE_NAME
+        if [ -s ../DEVICE_NAME ]; then
+          echo "DEVICE_NAME=_$(cat ../DEVICE_NAME)" >> "$ATOMGIT_ENV"
+        fi
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> "$ATOMGIT_ENV"
+
+    - name: 查看磁盘占用
+      if: ${{ !cancelled() }}
+      run: df -hT
+
+    - name: 整理固件产物
+      id: organize
+      if: ${{ env.UPLOAD_FIRMWARE == 'true' && !cancelled() }}
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> "$ATOMGIT_ENV"
+        echo "status=success" >> "$ATOMGIT_OUTPUT"
+        ls -lh
+
+    - name: 上传固件产物
+      if: ${{ steps.organize.outputs.status == 'success' && !cancelled() }}
+      uses: upload-artifact
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
