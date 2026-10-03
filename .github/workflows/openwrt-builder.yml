@@ -153,10 +153,37 @@ jobs:
         keep_minimum_runs: 2
 
     - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.3.4
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      uses: actions/github-script@v9
       with:
-        keep_latest: 3
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const owner = context.repo.owner;
+          const repo = context.repo.repo;
+          const KEEP = 3;
+          const releases = await github.paginate(
+            github.rest.repos.listReleases,
+            { owner, repo, per_page: 100 }
+          );
+          const sorted = releases.sort(
+            (a, b) => new Date(b.created_at) - new Date(a.created_at)
+          );
+          const toDelete = sorted.slice(KEEP);
+          console.log(`releases: ${sorted.length}, keeping: ${Math.min(KEEP, sorted.length)}, deleting: ${toDelete.length}`);
+          for (const rel of toDelete) {
+            if (rel.draft) {
+              console.log(`skip draft release ${rel.tag_name}`);
+              continue;
+            }
+            try {
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: rel.id });
+              console.log(`deleted release ${rel.tag_name}`);
+            } catch (e) {
+              core.warning(`delete release ${rel.tag_name} failed: ${e.message}`);
+            }
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: `tags/${rel.tag_name}` });
+              console.log(`deleted tag ${rel.tag_name}`);
+            } catch (e) {
+              core.warning(`delete tag ${rel.tag_name} failed: ${e.message}`);
+            }
+          }
